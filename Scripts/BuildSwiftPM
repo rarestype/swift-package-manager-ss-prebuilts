@@ -1,0 +1,105 @@
+#!/bin/bash
+
+# Builds SwiftPM from rarestype/swift-package-manager at $SWIFTPM_REVISION, against the
+# same dependency revisions as the $SWIFT_RELEASE toolchain, and packages it to install
+# over a toolchain's `usr`. Also leaves `swift-build-prebuilts` in `.build/release`.
+
+set -euo pipefail
+
+: "${SWIFT_RELEASE:?}" "${SWIFTPM_REVISION:?}"
+
+SWIFT_TAG="swift-${SWIFT_RELEASE}"
+ARCH="$(uname -m)"
+ROOT="$PWD"
+
+git init -q swiftpm
+git -C swiftpm fetch -q --depth 1 https://github.com/rarestype/swift-package-manager \
+    "$SWIFTPM_REVISION"
+git -C swiftpm checkout -q FETCH_HEAD
+
+cd swiftpm
+
+# SwiftPM's manifest follows release branches for its swiftlang dependencies, which move
+# ahead of what the toolchain shipped. Pin each of them to the toolchain's tag instead.
+swift package resolve
+
+jq -r '.pins[]
+    | select(.state.branch // "" | startswith("release/"))
+    | "\(.identity) \(.location)"' Package.resolved > ../branch-pins
+
+while read -r identity location; do
+    revision=$(git ls-remote "$location" "refs/tags/${SWIFT_TAG}" "refs/tags/${SWIFT_TAG}^{}" \
+        | tail -1 \
+        | cut -f 1)
+    if [[ -z "$revision" ]]; then
+        echo "💔 Error: ${location} has no tag ${SWIFT_TAG}" >&2
+        exit 1
+    fi
+    echo "pinning ${identity} to ${SWIFT_TAG} (${revision})"
+    jq --arg identity "$identity" --arg revision "$revision" \
+        '(.pins[] | select(.identity == $identity) | .state.revision) = $revision' \
+        Package.resolved > Package.resolved.new
+    mv Package.resolved.new Package.resolved
+done < ../branch-pins
+
+for product in swift-package-manager swift-build-prebuilts; do
+    swift build -c release --product "$product" --force-resolved-versions
+done
+
+# Check that the build really used the pinned revisions.
+while read -r identity location; do
+    expected=$(jq -r --arg identity "$identity" \
+        '.pins[] | select(.identity == $identity) | .state.revision' Package.resolved)
+    actual=$(git -C ".build/checkouts/$(basename "$location" .git)" rev-parse HEAD)
+    if [[ "$expected" != "$actual" ]]; then
+        echo "💔 Error: ${identity} is at ${actual}, expected ${expected}" >&2
+        exit 1
+    fi
+done < ../branch-pins
+
+# The toolchain's own binary finds the Swift runtime relative to itself; a binary built
+# here would otherwise point at this runner's toolchain.
+binary=.build/release/swift-package-manager
+patchelf --set-rpath '$ORIGIN/../lib/swift/linux' "$binary"
+runpath=$(readelf -d "$binary" | sed -n 's/.*Library runpath: \[\(.*\)\]/\1/p')
+if [[ "$runpath" != '$ORIGIN/../lib/swift/linux' ]]; then
+    echo "💔 Error: unexpected runpath '${runpath}'" >&2
+    exit 1
+fi
+
+stage="$ROOT/stage/usr"
+licenses="$stage/share/swift-package-manager/licenses"
+
+mkdir -p "$stage/bin" "$stage/share/pm" "$licenses"
+install -m 755 "$binary" "$stage/bin/swift-package"
+cp -R .build/release/*.bundle "$stage/share/pm/"
+
+# Every package linked into the binary keeps its license files at their original paths.
+collect_licenses() {
+    local source="$1"
+    local destination="$2"
+    mkdir -p "$destination"
+    (
+        cd "$source"
+        find . \( -name .git -o -name .build -o -name Tests -o -name Fixtures \) -prune \
+            -o -type f \( \
+            -name 'LICENSE' -o -name 'LICENSE.*' -o \
+            -name 'NOTICE' -o -name 'NOTICE.*' -o \
+            -name 'COPYING' -o -name 'COPYING.*' -o \
+            -name 'CONTRIBUTORS.txt' \
+        \) -print0 \
+            | xargs -0 -r cp --parents -t "$destination"
+    )
+}
+
+collect_licenses . "$licenses/swift-package-manager"
+for checkout in .build/checkouts/*; do
+    collect_licenses "$checkout" "$licenses/$(basename "$checkout")"
+done
+
+mkdir -p "$ROOT/artifacts"
+tar -C "$ROOT/stage" \
+    --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+    -czf "$ROOT/artifacts/swift-package-manager-${SWIFT_RELEASE}-linux-${ARCH}.tar.gz" usr
+
+echo "💖 SwiftPM ${SWIFT_RELEASE} (${SWIFTPM_REVISION}) built for ${ARCH}"

@@ -1,0 +1,69 @@
+name: Build
+
+on:
+    workflow_call:
+        inputs:
+            swift-release:
+                description: 'swift toolchain release identifier'
+                required: true
+                type: string
+
+jobs:
+    linux:
+        strategy:
+            matrix:
+                runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runs-on: ${{ matrix.runner }}
+        name: ${{ matrix.runner }}
+        env:
+            SWIFT_RELEASE: ${{ inputs.swift-release }}
+        steps:
+            -   name: 💝 Install Swift 💝
+                uses: rarestype/swift-install-action@v1
+                with:
+                    swift-release: ${{ inputs.swift-release }}
+
+            -   name: 💝 Checkout 💝
+                uses: actions/checkout@v6
+
+            -   name: 💝 Read pins 💝
+                run: |
+                    source "Releases/${SWIFT_RELEASE}"
+                    echo "SWIFTPM_REVISION=${SWIFTPM_REVISION}" >> "$GITHUB_ENV"
+                    echo "SWIFT_SYNTAX_VERSIONS=${SWIFT_SYNTAX_VERSIONS}" >> "$GITHUB_ENV"
+
+            -   name: 💝 Install patchelf 💝
+                run: |
+                    sudo apt-get update -q
+                    sudo apt-get install -y -q patchelf
+
+            -   name: 💝 Build SwiftPM 💝
+                run: Scripts/BuildSwiftPM
+
+            -   name: 💝 Build prebuilts 💝
+                run: Scripts/BuildPrebuilts
+
+            -   name: 💝 Upload SwiftPM 💝
+                uses: actions/upload-artifact@v7
+                with:
+                    name: swiftpm-${{ runner.arch }}
+                    path: artifacts/*.tar.gz
+                    retention-days: 1
+                    compression-level: 0
+
+            -   name: 💝 Upload prebuilts 💝
+                uses: actions/upload-artifact@v7
+                with:
+                    name: prebuilts-${{ runner.arch }}
+                    path: prebuilts/
+                    retention-days: 1
+                    compression-level: 0
+
+            #   the signing job runs on x86_64, so it only needs that build of the tool
+            -   name: 💝 Upload prebuilts tool 💝
+                if: runner.arch == 'X64'
+                uses: actions/upload-artifact@v7
+                with:
+                    name: swift-build-prebuilts
+                    path: swiftpm/.build/release/swift-build-prebuilts
+                    retention-days: 1
