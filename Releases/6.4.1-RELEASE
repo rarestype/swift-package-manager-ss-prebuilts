@@ -1,0 +1,4 @@
+# rarestype/swift-package-manager, branch rarest/6.4.1
+SWIFTPM_REVISION=17467a5932754f26e716ed09b408b56ccfb51f8a
+# swift-syntax versions to build prebuilts for
+SWIFT_SYNTAX_VERSIONS="603.0.2 604.0.0"

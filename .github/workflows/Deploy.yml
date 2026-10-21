@@ -1,0 +1,176 @@
+name: Deploy
+
+permissions:
+    contents: write
+on:
+    workflow_dispatch:
+        inputs:
+            swift-release:
+                description: 'swift toolchain release identifier, such as 6.4.1-RELEASE'
+                required: true
+                type: string
+
+concurrency:
+    group: deploy-${{ inputs.swift-release }}
+    cancel-in-progress: false
+
+jobs:
+    build:
+        uses: ./.github/workflows/Build.yml
+        with:
+            swift-release: ${{ inputs.swift-release }}
+
+    #   the only job that sees the signing key, and it compiles nothing
+    sign:
+        runs-on: ubuntu-24.04
+        needs: build
+        steps:
+            -   name: 💝 Install Swift 💝
+                uses: rarestype/swift-install-action@v1
+                with:
+                    swift-release: ${{ inputs.swift-release }}
+
+            -   name: 💝 Checkout 💝
+                uses: actions/checkout@v6
+
+            -   name: 💝 Download prebuilts 💝
+                uses: actions/download-artifact@v7
+                with:
+                    pattern: prebuilts-*
+                    merge-multiple: true
+                    path: prebuilts
+
+            -   name: 💝 Download prebuilts tool 💝
+                uses: actions/download-artifact@v7
+                with:
+                    name: swift-build-prebuilts
+                    path: tool
+
+            -   name: 💝 Sign 💝
+                run: |
+                    chmod +x tool/swift-build-prebuilts
+                    Scripts/SignPrebuilts
+                env:
+                    PREBUILTS_SIGNING_KEY: ${{ secrets.PREBUILTS_SIGNING_KEY }}
+                    PREBUILTS_TOOL: tool/swift-build-prebuilts
+
+            -   name: 💝 Upload signed prebuilts 💝
+                uses: actions/upload-artifact@v7
+                with:
+                    name: signed-prebuilts
+                    path: prebuilts/
+                    retention-days: 1
+                    compression-level: 0
+
+    verify:
+        strategy:
+            matrix:
+                runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runs-on: ${{ matrix.runner }}
+        name: verify (${{ matrix.runner }})
+        needs: sign
+        env:
+            SWIFT_RELEASE: ${{ inputs.swift-release }}
+        steps:
+            -   name: 💝 Install Swift 💝
+                uses: rarestype/swift-install-action@v1
+                with:
+                    swift-release: ${{ inputs.swift-release }}
+
+            -   name: 💝 Checkout 💝
+                uses: actions/checkout@v6
+
+            -   name: 💝 Read pins 💝
+                run: |
+                    source "Releases/${SWIFT_RELEASE}"
+                    echo "SWIFT_SYNTAX_VERSIONS=${SWIFT_SYNTAX_VERSIONS}" >> "$GITHUB_ENV"
+
+            -   name: 💝 Download SwiftPM 💝
+                uses: actions/download-artifact@v7
+                with:
+                    name: swiftpm-${{ runner.arch }}
+                    path: artifacts
+
+            -   name: 💝 Download signed prebuilts 💝
+                uses: actions/download-artifact@v7
+                with:
+                    name: signed-prebuilts
+                    path: prebuilts
+
+            #   the same thing the images do: replace the toolchain's SwiftPM in place
+            -   name: 💝 Install SwiftPM over the toolchain 💝
+                run: |
+                    usr="$(dirname "$(dirname "$(readlink -f "$(command -v swift)")")")"
+                    tar -C "$(dirname "$usr")" -xzf artifacts/swift-package-manager-*.tar.gz
+                    swift build --version
+
+            -   name: 💝 Verify prebuilts 💝
+                run: Scripts/VerifyPrebuilts
+
+    publish:
+        runs-on: ubuntu-24.04
+        needs: verify
+        env:
+            SWIFT_RELEASE: ${{ inputs.swift-release }}
+        steps:
+            -   name: 💝 Checkout 💝
+                uses: actions/checkout@v6
+
+            -   name: 💝 Read pins 💝
+                run: |
+                    source "Releases/${SWIFT_RELEASE}"
+                    echo "SWIFTPM_REVISION=${SWIFTPM_REVISION}" >> "$GITHUB_ENV"
+
+            -   name: 💝 Download SwiftPM 💝
+                uses: actions/download-artifact@v7
+                with:
+                    pattern: swiftpm-*
+                    merge-multiple: true
+                    path: artifacts
+
+            -   name: 💝 Download signed prebuilts 💝
+                uses: actions/download-artifact@v7
+                with:
+                    name: signed-prebuilts
+                    path: prebuilts
+
+            -   name: 💝 Setup R2 💝
+                uses: rarestype/r2-setup-action@v1
+                with:
+                    cloudflare-account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+                    r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+                    r2-access-key: ${{ secrets.R2_ACCESS_SECRET }}
+
+            -   name: 💝 Upload prebuilts 💝
+                run: Scripts/UploadPrebuilts
+
+            -   name: 💝 Release 💝
+                run: |
+                    tag="swift-${SWIFT_RELEASE}-${SWIFTPM_REVISION:0:9}"
+                    if gh release view "$tag" > /dev/null 2>&1; then
+                        echo "💔 Error: release ${tag} already exists, and releases are never replaced" >&2
+                        exit 1
+                    fi
+
+                    download="https://github.com/${{ github.repository }}/releases/download/${tag}"
+                    fork="https://github.com/rarestype/swift-package-manager/commit/${SWIFTPM_REVISION}"
+
+                    {
+                        echo "SwiftPM for Swift ${SWIFT_RELEASE}, built from [\`${SWIFTPM_REVISION:0:9}\`](${fork})."
+                        echo ""
+                        echo "| archive | checksum |"
+                        echo "| ------- | -------- |"
+                        for archive in artifacts/*.tar.gz; do
+                            name="${archive##*/}"
+                            echo "| [\`${name}\`](${download}/${name}) | \`$(sha256sum "$archive" | cut -d ' ' -f 1)\` |"
+                        done
+                        echo ""
+                        echo "Each archive installs over a toolchain's \`usr\`."
+                    } > notes.md
+
+                    gh release create "$tag" artifacts/*.tar.gz \
+                        --target "$GITHUB_SHA" \
+                        --title "${SWIFT_RELEASE} ✰ ${SWIFTPM_REVISION:0:9}" \
+                        --notes-file notes.md
+                env:
+                    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
